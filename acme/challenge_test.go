@@ -864,6 +864,7 @@ func TestHTTP01Validate(t *testing.T) {
 				"expected %s, but got foo", expKeyAuth))
 			baseClone := ch.clone()
 			baseClone.Error = expErr.ToACME()
+			baseClone.Error.Subproblems = append(baseClone.Error.Subproblems, expErr)
 			newCh := &http01Challenge{baseClone}
 			newb, err := json.Marshal(newCh)
 			assert.FatalError(t, err)
@@ -1752,6 +1753,7 @@ func TestDNS01Validate(t *testing.T) {
 				"domain %s: force", ch.getValue()))
 			baseClone := ch.clone()
 			baseClone.Error = expErr.ToACME()
+			baseClone.Error.Subproblems = append(baseClone.Error.Subproblems, expErr)
 			newCh := &dns01Challenge{baseClone}
 			newb, err := json.Marshal(newCh)
 			assert.FatalError(t, err)
@@ -1848,6 +1850,7 @@ func TestDNS01Validate(t *testing.T) {
 				"expected %s, but got %s", expKeyAuth, []string{"foo", "bar"}))
 			baseClone := ch.clone()
 			baseClone.Error = expErr.ToACME()
+			baseClone.Error.Subproblems = append(baseClone.Error.Subproblems, expErr)
 			newCh := &http01Challenge{baseClone}
 			newb, err := json.Marshal(newCh)
 			assert.FatalError(t, err)

@@ -133,12 +133,14 @@ func (h *Handler) GetChallenge(w http.ResponseWriter, r *http.Request) {
 	ch, err = h.Auth.ValidateChallenge(r.Context(), acc.GetID(), chID, acc.GetKey())
 	if err != nil {
 		api.WriteError(w, err)
-		return
+	} else if ch.Status != acme.StatusValid && ch.Status != acme.StatusInvalid {
+		w.Header().Add("Retry-After", "60")
+		api.JSON(w, ch)
+	} else {
+		w.Header().Add("Link", link(h.Auth.GetLink(r.Context(), acme.AuthzLink, true, ch.GetAuthzID()), "up"))
+		w.Header().Set("Location", h.Auth.GetLink(r.Context(), acme.ChallengeLink, true, ch.GetID()))
+		api.JSON(w, ch)
 	}
-
-	w.Header().Add("Link", link(h.Auth.GetLink(r.Context(), acme.AuthzLink, true, ch.GetAuthzID()), "up"))
-	w.Header().Set("Location", h.Auth.GetLink(r.Context(), acme.ChallengeLink, true, ch.GetID()))
-	api.JSON(w, ch)
 }
 
 // GetCertificate ACME api for retrieving a Certificate.
