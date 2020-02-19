@@ -293,7 +293,7 @@ func (a *Authority) ValidateChallenge(ctx context.Context, accID, chID string, j
 	dialer := &net.Dialer{
 		Timeout: 30 * time.Second,
 	}
-	for i:=0; i < 10; i++ {
+	for ch.getRetry().Active {
 		ch, err = ch.validate(a.db, jwk, validateOptions{
 			httpGet:   client.Get,
 			lookupTxt: net.LookupTXT,
