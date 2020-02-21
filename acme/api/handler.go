@@ -134,9 +134,13 @@ func (h *Handler) GetChallenge(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		api.WriteError(w, err)
 	} else if ch.Retry.Active {
-		retryAfter := int(ch.Retry.Backoffs) * (10 - ch.Retry.Called)
-		w.Header().Add("Retry-After", string(retryAfter))
-		api.WriteProcessing(w, ch)
+		retryAfter, err := h.Auth.BackoffChallenge(prov, acc.GetID(), chID, acc.GetKey())
+		if err != nil {
+			api.WriteError(w, err)
+		} else {
+			w.Header().Add("Retry-After", retryAfter.String())
+			api.WriteProcessing(w, ch)
+		}
 	} else {
 		w.Header().Add("Link", link(h.Auth.GetLink(r.Context(), acme.AuthzLink, true, ch.GetAuthzID()), "up"))
 		w.Header().Set("Location", h.Auth.GetLink(r.Context(), acme.ChallengeLink, true, ch.GetID()))

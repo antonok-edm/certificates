@@ -47,6 +47,7 @@ type mockAcmeAuthority struct {
 	loadProvisionerByID func(string) (provisioner.Interface, error)
 	newNonce            func() (string, error)
 	useNonce            func(string) error
+	backoffChallenge    func(p provisioner.Interface, accID, chID string, jwk *jose.JSONWebKey) (time.Duration, error)
 	ret1                interface{}
 	err                 error
 }
@@ -213,6 +214,17 @@ func (m *mockAcmeAuthority) ValidateChallenge(ctx context.Context, accID string,
 		return nil, m.err
 	default:
 		return m.ret1.(*acme.Challenge), m.err
+	}
+}
+
+func (m *mockAcmeAuthority) BackoffChallenge(p provisioner.Interface, accID, chID string, jwk *jose.JSONWebKey) (time.Duration, error) {
+	switch {
+	case m.backoffChallenge != nil:
+		return m.backoffChallenge(p, accID, chID, jwk)
+	case m.err != nil:
+		return -1, m.err
+	default:
+		return m.ret1.(time.Duration), m.err
 	}
 }
 
@@ -581,7 +593,7 @@ func ch() acme.Challenge {
 		URL:     "https://ca.smallstep.com/acme/challenge/chID",
 		ID:      "chID",
 		AuthzID: "authzID",
-		Retry:   &acme.Retry{Called:0, Backoffs:1, Active:false},
+		Retry:   &acme.Retry{Called: 0, Active: false},
 	}
 }
 

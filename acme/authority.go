@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"math"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,6 +22,7 @@ import (
 // Interface is the acme authority interface.
 type Interface interface {
 	GetDirectory(ctx context.Context) (*Directory, error)
+	BackoffChallenge(provisioner.Interface, string, string, *jose.JSONWebKey) (time.Duration, error)
 	NewNonce() (string, error)
 	UseNonce(string) error
 
@@ -310,8 +310,7 @@ func (a *Authority) ValidateChallenge(ctx context.Context, accID, chID string, j
 		if ch.getStatus() == StatusInvalid {
 			return ch.toACME(a.db, a.dir, p)
 		}
-		duration := time.Duration(ch.getRetry().Backoffs + math.Mod(rand.Float64(), 5))
-		time.Sleep(duration*time.Second)
+		time.Sleep(ch.getBackoff())
 	}
 	return ch.toACME(ctx, a.db, a.dir)
 }
@@ -326,4 +325,25 @@ func (a *Authority) GetCertificate(accID, certID string) ([]byte, error) {
 		return nil, UnauthorizedErr(errors.New("account does not own certificate"))
 	}
 	return cert.toACME(a.db, a.dir)
+}
+
+// BackoffChallenge returns the total time to wait until the next sequence of validation attempts completes
+func (a *Authority) BackoffChallenge(p provisioner.Interface, accID, chID string, jwk *jose.JSONWebKey) (time.Duration, error) {
+	ch, err := getChallenge(a.db, chID)
+	if err != nil {
+		return -1, err
+	}
+	if accID != ch.getAccountID() {
+		return -1, UnauthorizedErr(errors.New("account does not own challenge"))
+	}
+
+	remCalls := ch.getRetry().MaxAttempts - math.Mod(ch.getRetry().Called, ch.getRetry().MaxAttempts)
+	totBackoff := 0 * time.Second
+	for i := 0; i < int(remCalls); i++ {
+		clone := ch.clone()
+		clone.Retry.Called += float64(i)
+		totBackoff += clone.getBackoff()
+	}
+
+	return totBackoff, nil
 }
