@@ -6,10 +6,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"math"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
@@ -22,7 +24,6 @@ import (
 // Interface is the acme authority interface.
 type Interface interface {
 	GetDirectory(ctx context.Context) (*Directory, error)
-	BackoffChallenge(provisioner.Interface, string, string, *jose.JSONWebKey) (time.Duration, error)
 	NewNonce() (string, error)
 	UseNonce(string) error
 
@@ -63,7 +64,23 @@ var (
 	orderTable             = []byte("acme_orders")
 	ordersByAccountIDTable = []byte("acme_account_orders_index")
 	certTable              = []byte("acme_certs")
+	ordinal                int
 )
+
+// Ordinal is used during challenge retries to indicate ownership.
+func init() {
+	ordstr := os.Getenv("STEP_CA_ORDINAL")
+	if ordstr == "" {
+		ordinal = 0
+	} else {
+		ord, err := strconv.Atoi(ordstr)
+		if err != nil {
+			log.Fatal("Unrecognized ordinal ingeter value.")
+			panic(nil)
+		}
+		ordinal = ord
+	}
+}
 
 // NewAuthority returns a new Authority that implements the ACME interface.
 func NewAuthority(db nosql.DB, dns, prefix string, signAuth SignAuthority) (*Authority, error) {
@@ -271,48 +288,216 @@ func (a *Authority) GetAuthz(ctx context.Context, accID, authzID string) (*Authz
 	return az.toACME(ctx, a.db, a.dir)
 }
 
-// ValidateChallenge attempts to validate the challenge.
+// ValidateChallenge loads a challenge resource and then begins the validation process if the challenge
+// is not in one of its terminal states {valid|invalid}.
+//
+// The challenge validation state machine looks like:
+//
+// * https://tools.ietf.org/html/rfc8555#section-7.1.6
+//
+// While in the processing state, the server may retry as it sees fit. The challenge validation strategy
+// needs to be rather specific in order for retries to work in a replicated, crash-proof deployment.
+// In general, the goal is to allow requests to hit arbitrary instances of step-ca while managing retry
+// responsibility such that multiple instances agree on an owner. Additionally, when a deployment of the
+// CA is in progress, the ownership should be carried forward and new, updated (or in general, restarted),
+// instances should pick back up where the crashed instance left off.
+//
+// The steps are:
+//
+// 1. Upon incoming request to the challenge endpoint, take ownership of the retry responsibility.
+//  (a) Set Retry.Owner to this instance's ordinal (STEP_CA_ORDINAL).
+//  (b) Set Retry.NumAttempts to 0 and Retry.MaxAttempts to the desired max.
+//  (c) Set Challenge.Status to "processing"
+//  (d) Set retry_after to a time (retryInterval) in the future.
+// 2. Perform the validation attempt.
+// 3. If the validation attempt results in a challenge that is still processing, schedule a retry.
+//
+// It's possible that another request to re-attempt the challenge comes in while a retry attempt is
+// pending from a previous request. In general, these old attempts will see that Retry.NextAttempt
+// is in the future and drop their task. Because another instance may have taken ownership, old attempts
+// would also see a different ordinal than their own.
+//
+// 4. When the retry timer fires, check to make sure the retry should still process.
+//  (a) Refresh the challenge from the DB.
+//  (a) Check that Retry.Owner is equal to this instance's ordinal.
+//  (b) Check that Retry.NextAttempt is in the past.
+// 5. If the retry will commence, immediately update Retry.NextAttempt and save the challenge.
+//
+// Finally, if this instance is terminated, retries need to be reschedule when the instance restarts. This
+// is handled in the acme provisioner (authority/provisioner/acme.go) initialization.
+//
+// Note: the default ordinal does not need to be changed unless step-ca is running in a replicated scenario.
+//
 func (a *Authority) ValidateChallenge(ctx context.Context, accID, chID string, jwk *jose.JSONWebKey) (*Challenge, error) {
 	ch, err := getChallenge(a.db, chID)
 	if err != nil {
 		return nil, err
 	}
+
+	// Validate the challenge belongs to the account owned by the requester.
 	if accID != ch.getAccountID() {
 		return nil, UnauthorizedErr(errors.New("account does not own challenge"))
 	}
-	retry := ch.getRetry()
-	if retry.Active {
-		return ch.toACME(a.db, a.dir, p)
-	}
-	retry.Mux.Lock()
-	defer retry.Mux.Unlock()
 
+	p, err := ProvisionerFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Take ownership of the challenge status and retry state. The values must be reset.
+	up := ch.clone()
+	up.Status = StatusProcessing
+	up.Retry = &Retry{
+		Owner:         ordinal,
+		ProvisionerID: p.GetID(),
+		NumAttempts:   0,
+		MaxAttempts:   10,
+		NextAttempt:   time.Now().Add(retryInterval).UTC().Format(time.RFC3339),
+	}
+	err = up.save(a.db, ch)
+	if err != nil {
+		return nil, Wrap(err, "error saving challenge")
+	}
+	ch = up
+
+	v, err := a.validate(ch, jwk)
+	// An error here is non-recoverable. Recoverable errors are set on the challenge object
+	// and should not be returned directly.
+	if err != nil {
+		return nil, Wrap(err, "error attempting challenge validation")
+	}
+	err = v.save(a.db, ch)
+	if err != nil {
+		return nil, Wrap(err, "error saving challenge")
+	}
+	ch = v
+
+	switch ch.getStatus() {
+	case StatusValid, StatusInvalid:
+		break
+	case StatusProcessing:
+		if ch.getRetry().Active() {
+			time.AfterFunc(retryInterval, func() {
+				a.RetryChallenge(ch.getID())
+			})
+		}
+	default:
+		e := errors.Errorf("post-validation challenge in unexpected state, %s", ch.getStatus())
+		return nil, ServerInternalErr(e)
+	}
+	return ch.toACME(ctx, a.dir)
+}
+
+// The challenge validation process is specific to the type of challenge (dns-01, http-01, tls-alpn-01).
+// But, we still pass generic "options" to the polymorphic validate call.
+func (a *Authority) validate(ch challenge, jwk *jose.JSONWebKey) (challenge, error) {
 	client := http.Client{
 		Timeout: time.Duration(30 * time.Second),
 	}
 	dialer := &net.Dialer{
 		Timeout: 30 * time.Second,
 	}
-	for ch.getRetry().Active {
-		ch, err = ch.validate(a.db, jwk, validateOptions{
-			httpGet:   client.Get,
-			lookupTxt: net.LookupTXT,
-			tlsDial: func(network, addr string, config *tls.Config) (*tls.Conn, error) {
-				return tls.DialWithDialer(dialer, network, addr, config)
-			},
-		})
-		if err != nil {
-			return nil, Wrap(err, "error attempting challenge validation")
-		}
-		if ch.getStatus() == StatusValid {
-			break
-		}
-		if ch.getStatus() == StatusInvalid {
-			return ch.toACME(a.db, a.dir, p)
-		}
-		time.Sleep(ch.getBackoff())
+	return ch.validate(jwk, validateOptions{
+		httpGet:   client.Get,
+		lookupTxt: net.LookupTXT,
+		tlsDial: func(network, addr string, config *tls.Config) (*tls.Conn, error) {
+			return tls.DialWithDialer(dialer, network, addr, config)
+		},
+	})
+}
+
+const retryInterval = 12 * time.Second
+
+// RetryChallenge behaves similar to ValidateChallenge, but simply attempts to perform a validation and
+// write update the challenge record in the db if the challenge has remaining retry attempts.
+//
+// see: ValidateChallenge
+func (a *Authority) RetryChallenge(chID string) {
+	ch, err := getChallenge(a.db, chID)
+	if err != nil {
+		return
 	}
-	return ch.toACME(ctx, a.db, a.dir)
+	switch ch.getStatus() {
+	case StatusPending:
+		e := errors.New("pending challenges must first be moved to the processing state")
+		log.Printf("%v", e)
+		return
+	case StatusInvalid, StatusValid:
+		return
+	case StatusProcessing:
+		break
+	default:
+		e := errors.Errorf("unknown challenge state: %s", ch.getStatus())
+		log.Printf("%v", e)
+		return
+	}
+
+	// When retrying, check to make sure the ordinal has not changed.
+	// Make sure there are still retries left.
+	// Then check to make sure Retry.NextAttempt is in the past.
+	retry := ch.getRetry()
+	switch {
+	case retry.Owner != ordinal:
+		return
+	case !retry.Active():
+		return
+	}
+	t, err := time.Parse(time.RFC3339, retry.NextAttempt)
+	now := time.Now().UTC()
+	switch {
+	case err != nil:
+		return
+	case t.Before(now):
+		return
+	}
+
+	// Update the db so that other retries simply drop when their timer fires.
+	up := ch.clone()
+	up.Retry.NextAttempt = now.Add(retryInterval).UTC().Format(time.RFC3339)
+	up.Retry.NumAttempts++
+	err = up.save(a.db, ch)
+	if err != nil {
+		return
+	}
+	ch = up
+
+	p, err := a.LoadProvisionerByID(retry.ProvisionerID)
+	if err != nil {
+		return
+	}
+	if p.GetType() != provisioner.TypeACME {
+		log.Printf("%v", AccountDoesNotExistErr(errors.New("provisioner must be of type ACME")))
+		return
+	}
+	ctx := context.WithValue(context.Background(), ProvisionerContextKey, p)
+	acc, err := a.GetAccount(ctx, ch.getAccountID())
+	if err != nil {
+		return
+	}
+
+	v, err := a.validate(ch, acc.Key)
+	if err != nil {
+		return
+	}
+	err = v.save(a.db, ch)
+	if err != nil {
+		return
+	}
+	ch = v
+
+	switch ch.getStatus() {
+	case StatusValid, StatusInvalid:
+		break
+	case StatusProcessing:
+		if ch.getRetry().Active() {
+			time.AfterFunc(retryInterval, func() {
+				a.RetryChallenge(ch.getID())
+			})
+		}
+	default:
+		e := errors.Errorf("post-validation challenge in unexpected state, %s", ch.getStatus())
+		log.Printf("%v", e)
+	}
 }
 
 // GetCertificate retrieves the Certificate by ID.
@@ -325,25 +510,4 @@ func (a *Authority) GetCertificate(accID, certID string) ([]byte, error) {
 		return nil, UnauthorizedErr(errors.New("account does not own certificate"))
 	}
 	return cert.toACME(a.db, a.dir)
-}
-
-// BackoffChallenge returns the total time to wait until the next sequence of validation attempts completes
-func (a *Authority) BackoffChallenge(p provisioner.Interface, accID, chID string, jwk *jose.JSONWebKey) (time.Duration, error) {
-	ch, err := getChallenge(a.db, chID)
-	if err != nil {
-		return -1, err
-	}
-	if accID != ch.getAccountID() {
-		return -1, UnauthorizedErr(errors.New("account does not own challenge"))
-	}
-
-	remCalls := ch.getRetry().MaxAttempts - math.Mod(ch.getRetry().Called, ch.getRetry().MaxAttempts)
-	totBackoff := 0 * time.Second
-	for i := 0; i < int(remCalls); i++ {
-		clone := ch.clone()
-		clone.Retry.Called += float64(i)
-		totBackoff += clone.getBackoff()
-	}
-
-	return totBackoff, nil
 }
