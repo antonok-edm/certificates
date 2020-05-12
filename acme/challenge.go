@@ -287,6 +287,19 @@ func unmarshalChallenge(data []byte) (challenge, error) {
 	}
 }
 
+func (bc *baseChallenge) morph() challenge {
+	switch bc.getType() {
+	case "dns-01":
+		return &dns01Challenge{bc}
+	case "http-01":
+		return &http01Challenge{bc}
+	case "tls-alpn-01":
+		return &tlsALPN01Challenge{bc}
+	default:
+		return bc
+	}
+}
+
 // Retry information for challenges is internally relevant and needs to be stored in the DB, but should not be part
 // of the public challenge API apart from the Retry-After header.
 type Retry struct {
