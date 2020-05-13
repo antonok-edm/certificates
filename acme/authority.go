@@ -333,6 +333,15 @@ func (a *Authority) ValidateChallenge(ctx context.Context, accID, chID string, j
 	if err != nil {
 		return nil, err
 	}
+	switch ch.getStatus() {
+	case StatusPending, StatusProcessing:
+		break
+	case StatusInvalid, StatusValid:
+		return ch.toACME(ctx, a.dir)
+	default:
+		e := errors.Errorf("unknown challenge state: %s", ch.getStatus())
+		return nil, ServerInternalErr(e)
+	}
 
 	// Validate the challenge belongs to the account owned by the requester.
 	if accID != ch.getAccountID() {
