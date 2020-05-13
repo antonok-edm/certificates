@@ -737,6 +737,7 @@ func TestHandlerGetChallenge(t *testing.T) {
 			chJSON, err := json.Marshal(ch)
 			assert.FatalError(t, err)
 			ctx = context.WithValue(ctx, acme.PayloadContextKey, &payloadInfo{value: chJSON})
+			count := 0
 			return test{
 				auth: &mockAcmeAuthority{
 					validateChallenge: func(ctx context.Context, accID, id string, jwk *jose.JSONWebKey) (*acme.Challenge, error) {
@@ -747,6 +748,23 @@ func TestHandlerGetChallenge(t *testing.T) {
 						assert.Equals(t, id, ch.ID)
 						assert.Equals(t, jwk.KeyID, key.KeyID)
 						return &ch, nil
+					},
+					getLink: func(ctx context.Context, typ acme.Link, abs bool, in ...string) string {
+						var ret string
+						switch count {
+						case 0:
+							assert.Equals(t, typ, acme.AuthzLink)
+							assert.True(t, abs)
+							assert.Equals(t, in, []string{ch.AuthzID})
+							ret = fmt.Sprintf("%s/acme/%s/authz/%s", baseURL.String(), provName, ch.AuthzID)
+						case 1:
+							assert.Equals(t, typ, acme.ChallengeLink)
+							assert.True(t, abs)
+							assert.Equals(t, in, []string{ch.ID})
+							ret = url
+						}
+						count++
+						return ret
 					},
 				},
 				ctx:        ctx,

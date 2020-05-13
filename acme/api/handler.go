@@ -167,22 +167,16 @@ func (h *Handler) GetChallenge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch ch.Status {
-	case acme.StatusPending:
-		panic("validation attempt did not move challenge to the processing state")
-	// When a transient error occurs, the challenge will not be progressed to the `invalid` state.
-	// Add a Retry-After header to indicate that the client should check again in the future.
-	case acme.StatusProcessing:
+	w.Header().Add("Link", link(h.Auth.GetLink(r.Context(), acme.AuthzLink, true, ch.GetAuthzID()), "up"))
+	w.Header().Set("Location", h.Auth.GetLink(r.Context(), acme.ChallengeLink, true, ch.GetID()))
+
+	if ch.Status == acme.StatusProcessing {
 		w.Header().Add("Retry-After", ch.RetryAfter)
+		// 200s are cachable. Don't cache this because it will likely change.
 		w.Header().Add("Cache-Control", "no-cache")
-		api.JSON(w, ch)
-	case acme.StatusValid, acme.StatusInvalid:
-		w.Header().Add("Link", link(h.Auth.GetLink(r.Context(), acme.AuthzLink, true, ch.GetAuthzID()), "up"))
-		w.Header().Set("Location", h.Auth.GetLink(r.Context(), acme.ChallengeLink, true, ch.GetID()))
-		api.JSON(w, ch)
-	default:
-		panic("unexpected challenge state" + ch.Status)
 	}
+
+	api.JSON(w, ch)
 }
 
 // GetCertificate ACME api for retrieving a Certificate.
