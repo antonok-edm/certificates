@@ -176,9 +176,7 @@ func (h *Handler) GetChallenge(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Retry-After", ch.RetryAfter)
 		w.Header().Add("Cache-Control", "no-cache")
 		api.JSON(w, ch)
-	case acme.StatusInvalid:
-		api.JSON(w, ch)
-	case acme.StatusValid:
+	case acme.StatusValid, acme.StatusInvalid:
 		w.Header().Add("Link", link(h.Auth.GetLink(r.Context(), acme.AuthzLink, true, ch.GetAuthzID()), "up"))
 		w.Header().Set("Location", h.Auth.GetLink(r.Context(), acme.ChallengeLink, true, ch.GetID()))
 		api.JSON(w, ch)
