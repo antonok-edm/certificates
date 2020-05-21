@@ -396,7 +396,7 @@ func (hc *http01Challenge) validate(jwk *jose.JSONWebKey, vo validateOptions) (c
 	// fail
 	up.Status = StatusInvalid
 	e := errors.Errorf("keyAuthorization does not match; expected %s, but got %s", expected, keyAuth)
-	up.Error = RejectedIdentifierErr(e).ToACME()
+	up.Error = IncorrectResponseErr(e).ToACME()
 	up.Retry = nil
 	return up, nil
 }
@@ -590,7 +590,7 @@ func (dc *dns01Challenge) validate(jwk *jose.JSONWebKey, vo validateOptions) (ch
 	if err != nil {
 		e := errors.Wrapf(err, "error looking up TXT records for domain %s", domain)
 		up.Error = DNSErr(e).ToACME()
-		return dc, nil
+		return up, nil
 	}
 
 	expectedKeyAuth, err := KeyAuthorization(dc.Token, jwk)
@@ -608,7 +608,7 @@ func (dc *dns01Challenge) validate(jwk *jose.JSONWebKey, vo validateOptions) (ch
 
 	for _, r := range txtRecords {
 		if r == expected {
-			up.Validated = time.Now().UTC()
+			up.Validated = clock.Now()
 			up.Status = StatusValid
 			up.Error = nil
 			up.Retry = nil
