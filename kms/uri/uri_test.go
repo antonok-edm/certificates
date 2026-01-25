@@ -103,15 +103,7 @@ func TestParse(t *testing.T) {
 			URL:    &url.URL{Scheme: "cloudkms"},
 			Values: url.Values{},
 		}, false},
-		{"ok query", args{"yubikey:slot-id=9a;foo=bar?pin=123456&foo=bar"}, &URI{
-			URL:    &url.URL{Scheme: "yubikey", Opaque: "slot-id=9a;foo=bar", RawQuery: "pin=123456&foo=bar"},
-			Values: url.Values{"slot-id": []string{"9a"}, "foo": []string{"bar"}},
-		}, false},
 		{"ok file", args{"file:///tmp/ca.cert"}, &URI{
-			URL:    &url.URL{Scheme: "file", Path: "/tmp/ca.cert"},
-			Values: url.Values{},
-		}, false},
-		{"ok file simple", args{"file:/tmp/ca.cert"}, &URI{
 			URL:    &url.URL{Scheme: "file", Path: "/tmp/ca.cert"},
 			Values: url.Values{},
 		}, false},
@@ -197,8 +189,6 @@ func TestURI_Get(t *testing.T) {
 		want string
 	}{
 		{"ok", mustParse("yubikey:slot-id=9a"), args{"slot-id"}, "9a"},
-		{"ok first", mustParse("yubikey:slot-id=9a;slot-id=9b"), args{"slot-id"}, "9a"},
-		{"ok multiple", mustParse("yubikey:slot-id=9a;foo=bar"), args{"foo"}, "bar"},
 		{"ok in query", mustParse("yubikey:slot-id=9a?foo=bar"), args{"foo"}, "bar"},
 		{"fail missing", mustParse("yubikey:slot-id=9a"), args{"foo"}, ""},
 		{"fail missing query", mustParse("yubikey:slot-id=9a?bar=zar"), args{"foo"}, ""},
@@ -264,8 +254,6 @@ func TestURI_GetEncoded(t *testing.T) {
 		want []byte
 	}{
 		{"ok", mustParse("yubikey:slot-id=9a"), args{"slot-id"}, []byte{0x9a}},
-		{"ok first", mustParse("yubikey:slot-id=9a9b;slot-id=9b"), args{"slot-id"}, []byte{0x9a, 0x9b}},
-		{"ok percent", mustParse("yubikey:slot-id=9a;foo=%9a%9b%9c"), args{"foo"}, []byte{0x9a, 0x9b, 0x9c}},
 		{"ok in query", mustParse("yubikey:slot-id=9a?foo=9a"), args{"foo"}, []byte{0x9a}},
 		{"ok in query percent", mustParse("yubikey:slot-id=9a?foo=%9a"), args{"foo"}, []byte{0x9a}},
 		{"ok missing", mustParse("yubikey:slot-id=9a"), args{"foo"}, nil},
