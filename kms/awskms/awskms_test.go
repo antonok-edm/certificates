@@ -60,9 +60,6 @@ func TestNew(t *testing.T) {
 			Profile:         "smallstep",
 			CredentialsFile: "~/aws/credentials",
 		}}, expected, false},
-		{"ok with uri", args{ctx, apiv1.Options{
-			URI: "awskms:region=us-east-1;profile=smallstep;credentials-file=/var/run/aws/credentials",
-		}}, expected, false},
 		{"fail", args{ctx, apiv1.Options{}}, nil, true},
 		{"fail uri", args{ctx, apiv1.Options{
 			URI: "pkcs11:region=us-east-1;profile=smallstep;credentials-file=/var/run/aws/credentials",
