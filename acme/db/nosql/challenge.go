@@ -13,16 +13,21 @@ import (
 )
 
 type dbChallenge struct {
-	ID          string             `json:"id"`
-	AccountID   string             `json:"accountID"`
-	Type        acme.ChallengeType `json:"type"`
-	Status      acme.Status        `json:"status"`
-	Token       string             `json:"token"`
-	Value       string             `json:"value"`
-	Target      string             `json:"target,omitempty"`
-	ValidatedAt string             `json:"validatedAt"`
-	CreatedAt   time.Time          `json:"createdAt"`
-	Error       *acme.Error        `json:"error"` // TODO(hs): a bit dangerous; should become db-specific type
+	ID                 string             `json:"id"`
+	AccountID          string             `json:"accountID"`
+	Type               acme.ChallengeType `json:"type"`
+	Status             acme.Status        `json:"status"`
+	Token              string             `json:"token"`
+	Value              string             `json:"value"`
+	Target             string             `json:"target,omitempty"`
+	ValidatedAt        string             `json:"validatedAt"`
+	CreatedAt          time.Time          `json:"createdAt"`
+	Error              *acme.Error        `json:"error"` // TODO(hs): a bit dangerous; should become db-specific type
+	RetryOwner         int                `json:"retryOwner,omitempty"`
+	RetryProvisionerID string             `json:"retryProvisionerID,omitempty"`
+	RetryNumAttempts   int                `json:"retryNumAttempts,omitempty"`
+	RetryMaxAttempts   int                `json:"retryMaxAttempts,omitempty"`
+	RetryNextAttempt   string             `json:"retryNextAttempt,omitempty"`
 }
 
 func (dbc *dbChallenge) clone() *dbChallenge {
@@ -88,6 +93,18 @@ func (db *DB) GetChallenge(ctx context.Context, id, authzID string) (*acme.Chall
 		ValidatedAt: dbch.ValidatedAt,
 		Target:      dbch.Target,
 	}
+
+	// Restore retry state from database if present
+	if dbch.RetryMaxAttempts > 0 {
+		ch.Retry = &acme.Retry{
+			Owner:         dbch.RetryOwner,
+			ProvisionerID: dbch.RetryProvisionerID,
+			NumAttempts:   dbch.RetryNumAttempts,
+			MaxAttempts:   dbch.RetryMaxAttempts,
+			NextAttempt:   dbch.RetryNextAttempt,
+		}
+	}
+
 	return ch, nil
 }
 
@@ -104,6 +121,22 @@ func (db *DB) UpdateChallenge(ctx context.Context, ch *acme.Challenge) error {
 	nu.Status = ch.Status
 	nu.Error = ch.Error
 	nu.ValidatedAt = ch.ValidatedAt
+
+	// Persist or clear retry state
+	if ch.Retry != nil {
+		nu.RetryOwner = ch.Retry.Owner
+		nu.RetryProvisionerID = ch.Retry.ProvisionerID
+		nu.RetryNumAttempts = ch.Retry.NumAttempts
+		nu.RetryMaxAttempts = ch.Retry.MaxAttempts
+		nu.RetryNextAttempt = ch.Retry.NextAttempt
+	} else {
+		// Clear retry state
+		nu.RetryOwner = 0
+		nu.RetryProvisionerID = ""
+		nu.RetryNumAttempts = 0
+		nu.RetryMaxAttempts = 0
+		nu.RetryNextAttempt = ""
+	}
 
 	return db.save(ctx, old.ID, nu, old, "challenge", challengeTable)
 }

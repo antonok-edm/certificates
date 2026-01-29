@@ -14,7 +14,8 @@ var (
 	StatusDeactivated = Status("deactivated")
 	// StatusReady -- ready; e.g. for an Order that is ready to be finalized.
 	StatusReady = Status("ready")
+	// StatusProcessing -- processing e.g. a Challenge that is in the process of being validated.
+	StatusProcessing = Status("processing")
 	//statusExpired     = "expired"
 	//statusActive      = "active"
-	//statusProcessing  = "processing"
 )
