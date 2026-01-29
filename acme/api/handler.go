@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi"
@@ -31,6 +34,29 @@ func (c *Clock) Now() time.Time {
 }
 
 var clock Clock
+
+// ordinal identifies this instance for retry ownership in multi-instance deployments.
+var ordinal int
+
+func init() {
+	ordstr := os.Getenv("STEP_CA_ORDINAL")
+	if ordstr == "" {
+		ordinal = 0
+	} else {
+		ord, err := strconv.Atoi(ordstr)
+		if err != nil {
+			log.Fatal("Unrecognized ordinal integer value.")
+		}
+		ordinal = ord
+	}
+}
+
+const (
+	// retryInterval is the time between retry attempts.
+	retryInterval = 12 * time.Second
+	// maxRetryAttempts is the maximum number of retry attempts.
+	maxRetryAttempts = 10
+)
 
 type payloadInfo struct {
 	value       []byte
@@ -278,7 +304,42 @@ func GetAuthorization(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, az)
 }
 
-// GetChallenge ACME api for retrieving a Challenge.
+// GetChallenge is the ACME api for retrieving a Challenge resource.
+//
+// Potential Challenges are requested by the client when creating an order.
+// Once the client knows the appropriate validation resources are provisioned,
+// it makes a POST-as-GET request to this endpoint in order to initiate the
+// validation flow.
+//
+// The validation state machine describes the flow for a challenge.
+//
+//   https://tools.ietf.org/html/rfc8555#section-7.1.6
+//
+// Once a validation attempt has completed without error, the challenge's
+// status is updated depending on the result (valid|invalid) of the server's
+// validation attempt. Once this is the case, a challenge cannot be reset.
+//
+// If a challenge cannot be completed because no suitable data can be
+// acquired the server (whilst communicating retry information) and the
+// client (whilst respecting the information from the server) may request
+// retries of the validation.
+//
+//   https://tools.ietf.org/html/rfc8555#section-8.2
+//
+// Retry status is communicated using the error field and by sending a
+// Retry-After header back to the client.
+//
+// The request body is challenge-specific. The current challenges (http-01,
+// dns-01, tls-alpn-01) simply expect an empty object ("{}") in the payload
+// of the JWT sent by the client. We don't gain anything by stricly enforcing
+// nonexistence of unknown attributes, or, in these three cases, enforcing
+// an empty payload. And the spec also says to just ignore it:
+//
+// > The server MUST ignore any fields in the response object
+// > that are not specified as response fields for this type of challenge.
+//
+//    https://tools.ietf.org/html/rfc8555#section-7.5.1
+//
 func GetChallenge(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	db := acme.MustDatabaseFromContext(ctx)
@@ -289,19 +350,19 @@ func GetChallenge(w http.ResponseWriter, r *http.Request) {
 		render.Error(w, err)
 		return
 	}
-	// Just verify that the payload was set, since we're not strictly adhering
-	// to ACME V2 spec for reasons specified below.
+	// Just verify that the payload was set since the client is required
+	// to send _something_.
 	_, err = payloadFromContext(ctx)
 	if err != nil {
 		render.Error(w, err)
 		return
 	}
 
-	// NOTE: We should be checking ^^^ that the request is either a POST-as-GET, or
-	// that the payload is an empty JSON block ({}). However, older ACME clients
-	// still send a vestigial body (rather than an empty JSON block) and
-	// strict enforcement would render these clients broken. For the time being
-	// we'll just ignore the body.
+	prov, err := provisionerFromContext(ctx)
+	if err != nil {
+		render.Error(w, err)
+		return
+	}
 
 	azID := chi.URLParam(r, "authzID")
 	ch, err := db.GetChallenge(ctx, chi.URLParam(r, "chID"), azID)
@@ -315,21 +376,159 @@ func GetChallenge(w http.ResponseWriter, r *http.Request) {
 			"account '%s' does not own challenge '%s'", acc.ID, ch.ID))
 		return
 	}
+
+	// Short-circuit for terminal states
+	switch ch.Status {
+	case acme.StatusValid, acme.StatusInvalid:
+		linker.LinkChallenge(ctx, ch, azID)
+		w.Header().Add("Link", link(linker.GetLink(ctx, acme.AuthzLinkType, azID), "up"))
+		w.Header().Set("Location", linker.GetLink(ctx, acme.ChallengeLinkType, azID, ch.ID))
+		render.JSON(w, ch)
+		return
+	}
+
 	jwk, err := jwkFromContext(ctx)
 	if err != nil {
 		render.Error(w, err)
 		return
 	}
+
+	// Take ownership for retry tracking
+	if ch.Status == acme.StatusPending {
+		ch.Status = acme.StatusProcessing
+		ch.Retry = &acme.Retry{
+			Owner:         ordinal,
+			ProvisionerID: prov.GetID(),
+			NumAttempts:   0,
+			MaxAttempts:   maxRetryAttempts,
+			NextAttempt:   clock.Now().Add(retryInterval).Format(time.RFC3339),
+		}
+		if err := db.UpdateChallenge(ctx, ch); err != nil {
+			render.Error(w, acme.WrapErrorISE(err, "error updating challenge"))
+			return
+		}
+	}
+
 	if err = ch.Validate(ctx, db, jwk); err != nil {
 		render.Error(w, acme.WrapErrorISE(err, "error validating challenge"))
 		return
+	}
+
+	// Populate RetryAfter for response if still processing
+	if ch.Status == acme.StatusProcessing && ch.Retry != nil {
+		ch.RetryAfter = ch.Retry.NextAttempt
+	}
+
+	// Schedule retry if still processing and retries remain
+	if ch.Status == acme.StatusProcessing && ch.Retry != nil && ch.Retry.Active() {
+		time.AfterFunc(retryInterval, func() {
+			retryChallenge(ch.ID, azID, prov, acc.ID)
+		})
 	}
 
 	linker.LinkChallenge(ctx, ch, azID)
 
 	w.Header().Add("Link", link(linker.GetLink(ctx, acme.AuthzLinkType, azID), "up"))
 	w.Header().Set("Location", linker.GetLink(ctx, acme.ChallengeLinkType, azID, ch.ID))
+	if ch.Status == acme.StatusProcessing && ch.RetryAfter != "" {
+		w.Header().Add("Retry-After", ch.RetryAfter)
+		// 200s are cachable. Don't cache this because it will likely change.
+		w.Header().Add("Cache-Control", "no-cache")
+	}
 	render.JSON(w, ch)
+}
+
+// retryChallenge behaves similar to validation in GetChallenge, but simply attempts to perform a validation and
+// write update the challenge record in the db if the challenge has remaining retry attempts.
+//
+// see: GetChallenge
+func retryChallenge(chID, azID string, prov acme.Provisioner, accID string) {
+	ctx := context.Background()
+	db := acme.MustDatabaseFromContext(ctx)
+
+	ch, err := db.GetChallenge(ctx, chID, azID)
+	if err != nil {
+		log.Printf("retryChallenge: error loading challenge %s: %v", chID, err)
+		return
+	}
+
+	// Only proceed if still processing
+	if ch.Status != acme.StatusProcessing {
+		log.Printf("retryChallenge: challenge %s no longer processing (status=%s)", chID, ch.Status)
+		return
+	}
+
+	// Verify ownership
+	if ch.Retry == nil || ch.Retry.Owner != ordinal {
+		log.Printf("retryChallenge: challenge %s not owned by this instance", chID)
+		return
+	}
+
+	// Check if it's time for retry
+	nextAttempt, err := time.Parse(time.RFC3339, ch.Retry.NextAttempt)
+	if err != nil {
+		log.Printf("retryChallenge: error parsing NextAttempt for challenge %s: %v", chID, err)
+		return
+	}
+	if time.Now().Before(nextAttempt) {
+		// Not yet time, reschedule
+		time.AfterFunc(time.Until(nextAttempt), func() {
+			retryChallenge(chID, azID, prov, accID)
+		})
+		return
+	}
+
+	// Check if retries exhausted
+	if !ch.Retry.Active() {
+		// Mark as invalid - retries exhausted
+		ch.Status = acme.StatusInvalid
+		if ch.Error == nil {
+			ch.Error = acme.NewError(acme.ErrorConnectionType, "challenge validation failed after %d attempts", ch.Retry.MaxAttempts)
+		}
+		ch.Retry = nil
+		if err := db.UpdateChallenge(ctx, ch); err != nil {
+			log.Printf("retryChallenge: error updating exhausted challenge %s: %v", chID, err)
+		}
+		return
+	}
+
+	// Update attempt counter and next attempt time
+	ch.Retry.NumAttempts++
+	ch.Retry.NextAttempt = clock.Now().Add(retryInterval).Format(time.RFC3339)
+	if err := db.UpdateChallenge(ctx, ch); err != nil {
+		log.Printf("retryChallenge: error updating retry state for challenge %s: %v", chID, err)
+		return
+	}
+
+	acmeProv, ok := prov.(*provisioner.ACME)
+	if !ok {
+		log.Printf("retryChallenge: provisioner %s is not ACME type", prov.GetName())
+		return
+	}
+
+	// Load account to get JWK
+	acc, err := db.GetAccount(ctx, accID)
+	if err != nil {
+		log.Printf("retryChallenge: error loading account %s: %v", accID, err)
+		return
+	}
+
+	// Build context with provisioner
+	ctx = acme.NewProvisionerContext(ctx, acme.Provisioner(acmeProv))
+
+	// Perform validation
+	ch.AuthorizationID = azID
+	if err = ch.Validate(ctx, db, acc.Key); err != nil {
+		log.Printf("retryChallenge: error validating challenge %s: %v", chID, err)
+		return
+	}
+
+	// Schedule next retry if still processing
+	if ch.Status == acme.StatusProcessing && ch.Retry != nil && ch.Retry.Active() {
+		time.AfterFunc(retryInterval, func() {
+			retryChallenge(chID, azID, prov, accID)
+		})
+	}
 }
 
 // GetCertificate ACME api for retrieving a Certificate.
