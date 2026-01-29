@@ -43,6 +43,8 @@ type Challenge struct {
 	ValidatedAt     string        `json:"validated,omitempty"`
 	URL             string        `json:"url"`
 	Error           *Error        `json:"error,omitempty"`
+	RetryAfter      string        `json:"retry_after,omitempty"`
+	Retry           *Retry        `json:"-"`
 }
 
 // ToLog enables response logging.
@@ -59,9 +61,14 @@ func (ch *Challenge) ToLog() (interface{}, error) {
 // satisfactorily validated, the 'status' and 'validated' attributes are
 // updated.
 func (ch *Challenge) Validate(ctx context.Context, db DB, jwk *jose.JSONWebKey, vo *ValidateChallengeOptions) error {
-	// If already valid or invalid then return without performing validation.
-	if ch.Status != StatusPending {
+	// Check status - only validate pending or processing challenges
+	switch ch.Status {
+	case StatusPending, StatusProcessing:
+		// Continue to validation
+	case StatusValid, StatusInvalid:
 		return nil
+	default:
+		return NewErrorISE("unexpected challenge status: %s", ch.Status)
 	}
 	switch ch.Type {
 	case HTTP01:
@@ -80,11 +87,14 @@ func http01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWeb
 
 	resp, err := vo.HTTPGet(u.String())
 	if err != nil {
+		// Transient error - don't mark invalid, allow retry
 		return storeError(ctx, db, ch, false, WrapError(ErrorConnectionType, err,
 			"error doing http GET for url %s", u))
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode >= 400 {
+		// Transient error - server responded but with error status
 		return storeError(ctx, db, ch, false, NewError(ErrorConnectionType,
 			"error doing http GET for url %s with status code %d", u, resp.StatusCode))
 	}
@@ -101,13 +111,15 @@ func http01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWeb
 		return err
 	}
 	if keyAuth != expected {
-		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+		// Terminal failure - wrong key authorization
+		return storeError(ctx, db, ch, true, NewError(ErrorIncorrectResponseType,
 			"keyAuthorization does not match; expected %s, but got %s", expected, keyAuth))
 	}
 
-	// Update and store the challenge.
+	// Success
 	ch.Status = StatusValid
 	ch.Error = nil
+	ch.Retry = nil
 	ch.ValidatedAt = clock.Now().Format(time.RFC3339)
 
 	if err = db.UpdateChallenge(ctx, ch); err != nil {
@@ -159,11 +171,13 @@ func tlsalpn01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSON
 	certs := cs.PeerCertificates
 
 	if len(certs) == 0 {
+		// Terminal failure - no certificates
 		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
 			"%s challenge for %s resulted in no certificates", ch.Type, ch.Value))
 	}
 
 	if cs.NegotiatedProtocol != "acme-tls/1" {
+		// Terminal failure - wrong protocol
 		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
 			"cannot negotiate ALPN acme-tls/1 protocol for tls-alpn-01 challenge"))
 	}
@@ -196,6 +210,7 @@ func tlsalpn01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSON
 	for _, ext := range leafCert.Extensions {
 		if idPeAcmeIdentifier.Equal(ext.Id) {
 			if !ext.Critical {
+				// Terminal failure - extension not critical
 				return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
 					"incorrect certificate for tls-alpn-01 challenge: acmeValidationV1 extension not critical"))
 			}
@@ -204,23 +219,27 @@ func tlsalpn01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSON
 			rest, err := asn1.Unmarshal(ext.Value, &extValue)
 
 			if err != nil || len(rest) > 0 || len(hashedKeyAuth) != len(extValue) {
+				// Terminal failure - malformed extension
 				return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
 					"incorrect certificate for tls-alpn-01 challenge: malformed acmeValidationV1 extension value"))
 			}
 
 			if subtle.ConstantTimeCompare(hashedKeyAuth[:], extValue) != 1 {
-				return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+				// Terminal failure - wrong key authorization
+				return storeError(ctx, db, ch, true, NewError(ErrorIncorrectResponseType,
 					"incorrect certificate for tls-alpn-01 challenge: "+
 						"expected acmeValidationV1 extension value %s for this challenge but got %s",
 					hex.EncodeToString(hashedKeyAuth[:]), hex.EncodeToString(extValue)))
 			}
 
+			// Success
 			ch.Status = StatusValid
 			ch.Error = nil
+			ch.Retry = nil
 			ch.ValidatedAt = clock.Now().Format(time.RFC3339)
 
 			if err = db.UpdateChallenge(ctx, ch); err != nil {
-				return WrapErrorISE(err, "tlsalpn01ValidateChallenge - error updating challenge")
+				return WrapErrorISE(err, "error updating challenge")
 			}
 			return nil
 		}
@@ -231,10 +250,12 @@ func tlsalpn01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSON
 	}
 
 	if foundIDPeAcmeIdentifierV1Obsolete {
+		// Terminal failure - obsolete extension
 		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
 			"incorrect certificate for tls-alpn-01 challenge: obsolete id-pe-acmeIdentifier in acmeValidationV1 extension"))
 	}
 
+	// Terminal failure - missing extension
 	return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
 		"incorrect certificate for tls-alpn-01 challenge: missing acmeValidationV1 extension"))
 }
@@ -248,8 +269,15 @@ func dns01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebK
 
 	txtRecords, err := vo.LookupTxt("_acme-challenge." + domain)
 	if err != nil {
+		// Transient error - DNS lookup failed, allow retry
 		return storeError(ctx, db, ch, false, WrapError(ErrorDNSType, err,
 			"error looking up TXT records for domain %s", domain))
+	}
+
+	if len(txtRecords) == 0 {
+		// Transient error - no records yet, allow retry
+		return storeError(ctx, db, ch, false, NewError(ErrorDNSType,
+			"no TXT record found at '%s'", "_acme-challenge."+domain))
 	}
 
 	expectedKeyAuth, err := KeyAuthorization(ch.Token, jwk)
@@ -258,6 +286,7 @@ func dns01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebK
 	}
 	h := sha256.Sum256([]byte(expectedKeyAuth))
 	expected := base64.RawURLEncoding.EncodeToString(h[:])
+
 	var found bool
 	for _, r := range txtRecords {
 		if r == expected {
@@ -266,13 +295,15 @@ func dns01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebK
 		}
 	}
 	if !found {
-		return storeError(ctx, db, ch, false, NewError(ErrorRejectedIdentifierType,
-			"keyAuthorization does not match; expected %s, but got %s", expectedKeyAuth, txtRecords))
+		// Terminal failure - records exist but don't match
+		return storeError(ctx, db, ch, true, NewError(ErrorIncorrectResponseType,
+			"keyAuthorization does not match; expected %s, but got %s", expected, txtRecords))
 	}
 
-	// Update and store the challenge.
+	// Success
 	ch.Status = StatusValid
 	ch.Error = nil
+	ch.Retry = nil
 	ch.ValidatedAt = clock.Now().Format(time.RFC3339)
 
 	if err = db.UpdateChallenge(ctx, ch); err != nil {
@@ -351,11 +382,14 @@ func KeyAuthorization(token string, jwk *jose.JSONWebKey) (string, error) {
 	return fmt.Sprintf("%s.%s", token, encPrint), nil
 }
 
-// storeError the given error to an ACME error and saves using the DB interface.
-func storeError(ctx context.Context, db DB, ch *Challenge, markInvalid bool, err *Error) error {
+// storeError stores the given error to the Challenge and persists it.
+// If terminal is true, the challenge is marked invalid and retry state is cleared.
+// If terminal is false, the error is stored but the challenge remains eligible for retry.
+func storeError(ctx context.Context, db DB, ch *Challenge, terminal bool, err *Error) error {
 	ch.Error = err
-	if markInvalid {
+	if terminal {
 		ch.Status = StatusInvalid
+		ch.Retry = nil
 	}
 	if err := db.UpdateChallenge(ctx, ch); err != nil {
 		return WrapErrorISE(err, "failure saving error to acme challenge")
@@ -372,4 +406,19 @@ type ValidateChallengeOptions struct {
 	HTTPGet   httpGetter
 	LookupTxt lookupTxt
 	TLSDial   tlsDialer
+}
+
+// Retry information for challenges is internally relevant and needs to be stored in the DB, but should not be part
+// of the public challenge API apart from the Retry-After header.
+type Retry struct {
+	Owner         int    `json:"owner"`
+	ProvisionerID string `json:"provisionerid"`
+	NumAttempts   int    `json:"numattempts"`
+	MaxAttempts   int    `json:"maxattempts"`
+	NextAttempt   string `json:"nextattempt"`
+}
+
+// Active returns a boolean indicating whether a Retry struct has remaining attempts or not.
+func (r *Retry) Active() bool {
+	return r.NumAttempts < r.MaxAttempts
 }
