@@ -316,6 +316,75 @@ func Test_storeError(t *testing.T) {
 				markInvalid: true,
 			}
 		},
+		"ok/terminal-clears-retry": func(t *testing.T) test {
+			ch := &Challenge{
+				ID:     "chID",
+				Token:  "token",
+				Value:  "zap.internal",
+				Status: StatusProcessing,
+				Retry: &Retry{
+					Owner:         1,
+					ProvisionerID: "provID",
+					NumAttempts:   2,
+					MaxAttempts:   5,
+				},
+			}
+			return test{
+				ch: ch,
+				db: &MockDB{
+					MockUpdateChallenge: func(ctx context.Context, updch *Challenge) error {
+						assert.Equal(t, updch.ID, ch.ID)
+						assert.Equal(t, updch.Token, ch.Token)
+						assert.Equal(t, updch.Value, ch.Value)
+						assert.Equal(t, updch.Status, StatusInvalid)
+						assert.Nil(t, updch.Retry)
+
+						assert.EqualError(t, updch.Error.Err, err.Err.Error())
+						assert.Equal(t, updch.Error.Type, err.Type)
+						assert.Equal(t, updch.Error.Detail, err.Detail)
+						assert.Equal(t, updch.Error.Status, err.Status)
+						assert.Equal(t, updch.Error.Detail, err.Detail)
+						return nil
+					},
+				},
+				markInvalid: true,
+			}
+		},
+		"ok/non-terminal-preserves-retry": func(t *testing.T) test {
+			retry := &Retry{
+				Owner:         1,
+				ProvisionerID: "provID",
+				NumAttempts:   2,
+				MaxAttempts:   5,
+			}
+			ch := &Challenge{
+				ID:     "chID",
+				Token:  "token",
+				Value:  "zap.internal",
+				Status: StatusProcessing,
+				Retry:  retry,
+			}
+			return test{
+				ch: ch,
+				db: &MockDB{
+					MockUpdateChallenge: func(ctx context.Context, updch *Challenge) error {
+						assert.Equal(t, updch.ID, ch.ID)
+						assert.Equal(t, updch.Token, ch.Token)
+						assert.Equal(t, updch.Value, ch.Value)
+						assert.Equal(t, updch.Status, StatusProcessing)
+						assert.Equal(t, updch.Retry, retry)
+
+						assert.EqualError(t, updch.Error.Err, err.Err.Error())
+						assert.Equal(t, updch.Error.Type, err.Type)
+						assert.Equal(t, updch.Error.Detail, err.Detail)
+						assert.Equal(t, updch.Error.Status, err.Status)
+						assert.Equal(t, updch.Error.Detail, err.Detail)
+						return nil
+					},
+				},
+				markInvalid: false,
+			}
+		},
 	}
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -853,6 +922,55 @@ func TestChallenge_Validate(t *testing.T) {
 				},
 			}
 		},
+		"ok/already-processing-continues": func(t *testing.T) test {
+			ch := &Challenge{
+				ID:     "chID",
+				Token:  "token",
+				Type:   "http-01",
+				Status: StatusProcessing,
+				Value:  "zap.internal",
+			}
+
+			return test{
+				ch: ch,
+				vc: &mockClient{
+					get: func(url string) (*http.Response, error) {
+						return nil, errors.New("force")
+					},
+				},
+				db: &MockDB{
+					MockUpdateChallenge: func(ctx context.Context, updch *Challenge) error {
+						assert.Equal(t, updch.ID, ch.ID)
+						assert.Equal(t, updch.Token, ch.Token)
+						assert.Equal(t, updch.Type, ch.Type)
+						assert.Equal(t, updch.Status, ch.Status)
+						assert.Equal(t, updch.Value, ch.Value)
+
+						err := NewError(ErrorConnectionType, "error doing http GET for url http://zap.internal/.well-known/acme-challenge/%s: force", ch.Token)
+						assert.EqualError(t, updch.Error.Err, err.Err.Error())
+						assert.Equal(t, updch.Error.Type, err.Type)
+						assert.Equal(t, updch.Error.Detail, err.Detail)
+						assert.Equal(t, updch.Error.Status, err.Status)
+						assert.Equal(t, updch.Error.Detail, err.Detail)
+						return nil
+					},
+				},
+			}
+		},
+		"fail/unexpected-status-foo": func(t *testing.T) test {
+			ch := &Challenge{
+				ID:     "chID",
+				Token:  "token",
+				Type:   "http-01",
+				Status: Status("foo"),
+				Value:  "zap.internal",
+			}
+
+			return test{
+				ch:  ch,
+				err: NewErrorISE("unexpected challenge status: foo"),
+			}
+		},
 	}
 	for name, run := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -1122,7 +1240,7 @@ func TestHTTP01Validate(t *testing.T) {
 						assert.Equal(t, "zap.internal", updch.Value)
 						assert.Equal(t, StatusInvalid, updch.Status)
 
-						err := NewError(ErrorRejectedIdentifierType,
+						err := NewError(ErrorIncorrectResponseType,
 							"keyAuthorization does not match; expected %s, but got foo", expKeyAuth)
 						assert.EqualError(t, updch.Error.Err, err.Err.Error())
 						assert.Equal(t, err.Type, updch.Error.Type)
@@ -1165,7 +1283,7 @@ func TestHTTP01Validate(t *testing.T) {
 						assert.Equal(t, "zap.internal", updch.Value)
 						assert.Equal(t, StatusInvalid, updch.Status)
 
-						err := NewError(ErrorRejectedIdentifierType,
+						err := NewError(ErrorIncorrectResponseType,
 							"keyAuthorization does not match; expected %s, but got foo", expKeyAuth)
 						assert.EqualError(t, updch.Error.Err, err.Err.Error())
 						assert.Equal(t, err.Type, updch.Error.Type)
@@ -1369,6 +1487,40 @@ func TestDNS01Validate(t *testing.T) {
 				},
 			}
 		},
+		"ok/empty-txt-records": func(t *testing.T) test {
+			ch := &Challenge{
+				ID:     "chID",
+				Token:  "token",
+				Value:  fulldomain,
+				Status: StatusPending,
+			}
+
+			return test{
+				ch: ch,
+				vc: &mockClient{
+					lookupTxt: func(url string) ([]string, error) {
+						return []string{}, nil
+					},
+				},
+				db: &MockDB{
+					MockUpdateChallenge: func(ctx context.Context, updch *Challenge) error {
+						assert.Equal(t, updch.ID, ch.ID)
+						assert.Equal(t, updch.Token, ch.Token)
+						assert.Equal(t, updch.Value, ch.Value)
+						assert.Equal(t, updch.Status, StatusPending)
+
+						err := NewError(ErrorDNSType, "no TXT record found at '%s'", "_acme-challenge."+domain)
+
+						assert.EqualError(t, updch.Error.Err, err.Err.Error())
+						assert.Equal(t, updch.Error.Type, err.Type)
+						assert.Equal(t, updch.Error.Detail, err.Detail)
+						assert.Equal(t, updch.Error.Status, err.Status)
+						assert.Equal(t, updch.Error.Detail, err.Detail)
+						return nil
+					},
+				},
+			}
+		},
 		"fail/key-auth-gen-error": func(t *testing.T) test {
 			ch := &Challenge{
 				ID:     "chID",
@@ -1405,6 +1557,8 @@ func TestDNS01Validate(t *testing.T) {
 
 			expKeyAuth, err := KeyAuthorization(ch.Token, jwk)
 			require.NoError(t, err)
+			h := sha256.Sum256([]byte(expKeyAuth))
+			expected := base64.RawURLEncoding.EncodeToString(h[:])
 
 			return test{
 				ch: ch,
@@ -1418,9 +1572,9 @@ func TestDNS01Validate(t *testing.T) {
 						assert.Equal(t, "chID", updch.ID)
 						assert.Equal(t, "token", updch.Token)
 						assert.Equal(t, fulldomain, updch.Value)
-						assert.Equal(t, StatusPending, updch.Status)
+						assert.Equal(t, StatusInvalid, updch.Status)
 
-						err := NewError(ErrorRejectedIdentifierType, "keyAuthorization does not match; expected %s, but got %s", expKeyAuth, []string{"foo", "bar"})
+						err := NewError(ErrorIncorrectResponseType, "keyAuthorization does not match; expected %s, but got %s", expected, []string{"foo", "bar"})
 
 						assert.EqualError(t, updch.Error.Err, err.Err.Error())
 						assert.Equal(t, err.Type, updch.Error.Type)
@@ -1448,6 +1602,8 @@ func TestDNS01Validate(t *testing.T) {
 
 			expKeyAuth, err := KeyAuthorization(ch.Token, jwk)
 			require.NoError(t, err)
+			h := sha256.Sum256([]byte(expKeyAuth))
+			expected := base64.RawURLEncoding.EncodeToString(h[:])
 
 			return test{
 				ch: ch,
@@ -1461,9 +1617,9 @@ func TestDNS01Validate(t *testing.T) {
 						assert.Equal(t, "chID", updch.ID)
 						assert.Equal(t, "token", updch.Token)
 						assert.Equal(t, fulldomain, updch.Value)
-						assert.Equal(t, StatusPending, updch.Status)
+						assert.Equal(t, StatusInvalid, updch.Status)
 
-						err := NewError(ErrorRejectedIdentifierType, "keyAuthorization does not match; expected %s, but got %s", expKeyAuth, []string{"foo", "bar"})
+						err := NewError(ErrorIncorrectResponseType, "keyAuthorization does not match; expected %s, but got %s", expected, []string{"foo", "bar"})
 
 						assert.EqualError(t, updch.Error.Err, err.Err.Error())
 						assert.Equal(t, err.Type, updch.Error.Type)
@@ -2425,7 +2581,7 @@ func TestTLSALPN01Validate(t *testing.T) {
 						assert.Equal(t, ChallengeType("tls-alpn-01"), updch.Type)
 						assert.Equal(t, "zap.internal", updch.Value)
 
-						err := NewError(ErrorRejectedIdentifierType, "incorrect certificate for tls-alpn-01 challenge: "+
+						err := NewError(ErrorIncorrectResponseType, "incorrect certificate for tls-alpn-01 challenge: "+
 							"expected acmeValidationV1 extension value %s for this challenge but got %s",
 							hex.EncodeToString(expKeyAuthHash[:]), hex.EncodeToString(incorrectTokenHash[:]))
 
@@ -2472,7 +2628,7 @@ func TestTLSALPN01Validate(t *testing.T) {
 						assert.Equal(t, ChallengeType("tls-alpn-01"), updch.Type)
 						assert.Equal(t, "zap.internal", updch.Value)
 
-						err := NewError(ErrorRejectedIdentifierType, "incorrect certificate for tls-alpn-01 challenge: "+
+						err := NewError(ErrorIncorrectResponseType, "incorrect certificate for tls-alpn-01 challenge: "+
 							"expected acmeValidationV1 extension value %s for this challenge but got %s",
 							hex.EncodeToString(expKeyAuthHash[:]), hex.EncodeToString(incorrectTokenHash[:]))
 
