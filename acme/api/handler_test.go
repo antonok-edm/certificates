@@ -578,14 +578,24 @@ func TestHandler_GetChallenge(t *testing.T) {
 							AccountID: "accID",
 						}, nil
 					},
-					MockUpdateChallenge: func(ctx context.Context, ch *acme.Challenge) error {
-						assert.Equals(t, ch.Status, acme.StatusPending)
-						assert.Equals(t, ch.Type, "http-01")
-						assert.Equals(t, ch.AccountID, "accID")
-						assert.Equals(t, ch.AuthorizationID, "authzID")
-						assert.HasSuffix(t, ch.Error.Type, acme.ErrorConnectionType.String())
-						return acme.NewErrorISE("force")
-					},
+					MockUpdateChallenge: func() func(ctx context.Context, ch *acme.Challenge) error {
+						updateCount := 0
+						return func(ctx context.Context, ch *acme.Challenge) error {
+							updateCount++
+							if updateCount == 1 {
+								// First update: pending -> processing
+								assert.Equals(t, ch.Status, acme.StatusProcessing)
+								return nil
+							}
+							// Second update: storeError with transient failure (status stays processing)
+							assert.Equals(t, ch.Status, acme.StatusProcessing)
+							assert.Equals(t, ch.Type, "http-01")
+							assert.Equals(t, ch.AccountID, "accID")
+							assert.Equals(t, ch.AuthorizationID, "authzID")
+							assert.HasSuffix(t, ch.Error.Type, acme.ErrorConnectionType.String())
+							return acme.NewErrorISE("force")
+						}
+					}(),
 				},
 				vco: &acme.ValidateChallengeOptions{
 					HTTPGet: func(string) (*http.Response, error) {
@@ -598,6 +608,10 @@ func TestHandler_GetChallenge(t *testing.T) {
 			}
 		},
 		"ok": func(t *testing.T) test {
+			// Compute expected RetryAfter using the same logic as the handler:
+			// clock.Now().Add(retryInterval).Format(time.RFC3339)
+			// where clock.Now() is time.Now().UTC().Truncate(time.Second)
+			retryTime := time.Now().UTC().Truncate(time.Second).Add(12 * time.Second).Format(time.RFC3339)
 			acc := &acme.Account{ID: "accID"}
 			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
@@ -620,28 +634,94 @@ func TestHandler_GetChallenge(t *testing.T) {
 							AccountID: "accID",
 						}, nil
 					},
-					MockUpdateChallenge: func(ctx context.Context, ch *acme.Challenge) error {
-						assert.Equals(t, ch.Status, acme.StatusPending)
-						assert.Equals(t, ch.Type, "http-01")
-						assert.Equals(t, ch.AccountID, "accID")
-						assert.Equals(t, ch.AuthorizationID, "authzID")
-						assert.HasSuffix(t, ch.Error.Type, acme.ErrorConnectionType.String())
-						return nil
-					},
+					MockUpdateChallenge: func() func(ctx context.Context, ch *acme.Challenge) error {
+						updateCount := 0
+						return func(ctx context.Context, ch *acme.Challenge) error {
+							updateCount++
+							if updateCount == 1 {
+								// First update: pending -> processing ownership transition
+								assert.Equals(t, ch.Status, acme.StatusProcessing)
+								return nil
+							}
+							// Second update: storeError with transient failure (status stays processing)
+							assert.Equals(t, ch.Status, acme.StatusProcessing)
+							assert.Equals(t, ch.Type, "http-01")
+							assert.Equals(t, ch.AccountID, "accID")
+							assert.Equals(t, ch.AuthorizationID, "authzID")
+							assert.HasSuffix(t, ch.Error.Type, acme.ErrorConnectionType.String())
+							return nil
+						}
+					}(),
 				},
 				ch: &acme.Challenge{
 					ID:              "chID",
-					Status:          acme.StatusPending,
+					Status:          acme.StatusProcessing,
 					AuthorizationID: "authzID",
 					Type:            "http-01",
 					AccountID:       "accID",
 					URL:             url,
+					RetryAfter:      retryTime,
 					Error:           acme.NewError(acme.ErrorConnectionType, "force"),
 				},
 				vco: &acme.ValidateChallengeOptions{
 					HTTPGet: func(string) (*http.Response, error) {
 						return nil, errors.New("force")
 					},
+				},
+				ctx:        ctx,
+				statusCode: 200,
+			}
+		},
+		"ok/processing-with-retry-after": func(t *testing.T) test {
+			retryTime := time.Now().Add(time.Minute).Format(time.RFC3339)
+			acc := &acme.Account{ID: "accID"}
+			ctx := context.WithValue(context.Background(), provisionerContextKey, prov)
+			ctx = context.WithValue(ctx, accContextKey, acc)
+			ctx = context.WithValue(ctx, payloadContextKey, &payloadInfo{isEmptyJSON: true})
+			_jwk, err := jose.GenerateJWK("EC", "P-256", "ES256", "sig", "", 0)
+			assert.FatalError(t, err)
+			_pub := _jwk.Public()
+			ctx = context.WithValue(ctx, jwkContextKey, &_pub)
+			ctx = context.WithValue(ctx, baseURLContextKey, baseURL)
+			ctx = context.WithValue(ctx, chi.RouteCtxKey, chiCtx)
+			return test{
+				db: &acme.MockDB{
+					MockGetChallenge: func(ctx context.Context, chID, azID string) (*acme.Challenge, error) {
+						assert.Equals(t, chID, "chID")
+						assert.Equals(t, azID, "authzID")
+						return &acme.Challenge{
+							ID:         "chID",
+							Status:     acme.StatusProcessing,
+							Type:       "http-01",
+							AccountID:  "accID",
+							RetryAfter: retryTime,
+							Retry: &acme.Retry{
+								Owner:       0,
+								NumAttempts: 1,
+								MaxAttempts: 10,
+								NextAttempt: retryTime,
+							},
+						}, nil
+					},
+					MockUpdateChallenge: func(ctx context.Context, ch *acme.Challenge) error {
+						assert.Equals(t, ch.Status, acme.StatusProcessing)
+						return nil
+					},
+				},
+				vco: &acme.ValidateChallengeOptions{
+					HTTPGet: func(string) (*http.Response, error) {
+						return nil, errors.New("force")
+					},
+				},
+				ch: &acme.Challenge{
+					ID:              "chID",
+					Status:          acme.StatusProcessing,
+					AuthorizationID: "authzID",
+					Type:            "http-01",
+					AccountID:       "accID",
+					URL:             url,
+					RetryAfter:      retryTime,
+					Error:           acme.NewError(acme.ErrorConnectionType, "force"),
 				},
 				ctx:        ctx,
 				statusCode: 200,
@@ -680,6 +760,12 @@ func TestHandler_GetChallenge(t *testing.T) {
 				assert.Equals(t, res.Header["Link"], []string{fmt.Sprintf("<%s/acme/%s/authz/%s>;rel=\"up\"", baseURL, provName, "authzID")})
 				assert.Equals(t, res.Header["Location"], []string{url})
 				assert.Equals(t, res.Header["Content-Type"], []string{"application/json"})
+
+				// Check Retry-After headers when status is processing
+				if tc.ch != nil && tc.ch.Status == acme.StatusProcessing && tc.ch.RetryAfter != "" {
+					assert.Equals(t, res.Header["Cache-Control"], []string{"no-cache"})
+					assert.Equals(t, res.Header["Retry-After"], []string{tc.ch.RetryAfter})
+				}
 			}
 		})
 	}

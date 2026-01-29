@@ -282,6 +282,34 @@ func TestDB_GetChallenge(t *testing.T) {
 				dbc: dbc,
 			}
 		},
+		"ok/with-retry-state": func(t *testing.T) test {
+			dbc := &dbChallenge{
+				ID:                 chID,
+				AccountID:          "accountID",
+				Type:               "dns-01",
+				Status:             acme.StatusProcessing,
+				Token:              "token",
+				Value:              "test.ca.smallstep.com",
+				CreatedAt:          clock.Now(),
+				RetryOwner:         1,
+				RetryProvisionerID: "provID",
+				RetryNumAttempts:   3,
+				RetryMaxAttempts:   10,
+				RetryNextAttempt:   "2025-01-28T12:00:00Z",
+			}
+			b, err := json.Marshal(dbc)
+			assert.FatalError(t, err)
+			return test{
+				db: &db.MockNoSQLDB{
+					MGet: func(bucket, key []byte) ([]byte, error) {
+						assert.Equals(t, bucket, challengeTable)
+						assert.Equals(t, string(key), chID)
+						return b, nil
+					},
+				},
+				dbc: dbc,
+			}
+		},
 	}
 	for name, run := range tests {
 		tc := run(t)
@@ -311,7 +339,17 @@ func TestDB_GetChallenge(t *testing.T) {
 					assert.Equals(t, ch.Token, tc.dbc.Token)
 					assert.Equals(t, ch.Value, tc.dbc.Value)
 					assert.Equals(t, ch.ValidatedAt, tc.dbc.ValidatedAt)
-					assert.Equals(t, ch.Error.Error(), tc.dbc.Error.Error())
+					if tc.dbc.Error != nil {
+						assert.Equals(t, ch.Error.Error(), tc.dbc.Error.Error())
+					}
+					if tc.dbc.RetryMaxAttempts > 0 {
+						assert.NotNil(t, ch.Retry)
+						assert.Equals(t, ch.Retry.Owner, tc.dbc.RetryOwner)
+						assert.Equals(t, ch.Retry.ProvisionerID, tc.dbc.RetryProvisionerID)
+						assert.Equals(t, ch.Retry.NumAttempts, tc.dbc.RetryNumAttempts)
+						assert.Equals(t, ch.Retry.MaxAttempts, tc.dbc.RetryMaxAttempts)
+						assert.Equals(t, ch.Retry.NextAttempt, tc.dbc.RetryNextAttempt)
+					}
 				}
 			}
 		})
@@ -433,6 +471,96 @@ func TestDB_UpdateChallenge(t *testing.T) {
 						assert.Equals(t, dbNew.Status, acme.StatusValid)
 						assert.Equals(t, dbNew.ValidatedAt, "foobar")
 						assert.Equals(t, dbNew.Error.Error(), acme.NewError(acme.ErrorMalformedType, "malformed").Error())
+						return nu, true, nil
+					},
+				},
+			}
+		},
+		"ok/with-retry-state": func(t *testing.T) test {
+			retry := &acme.Retry{
+				Owner:         2,
+				ProvisionerID: "newProvID",
+				NumAttempts:   5,
+				MaxAttempts:   10,
+				NextAttempt:   "2025-01-28T14:00:00Z",
+			}
+			updCh := &acme.Challenge{
+				ID:          dbc.ID,
+				AccountID:   dbc.AccountID,
+				Type:        dbc.Type,
+				Token:       dbc.Token,
+				Value:       dbc.Value,
+				Status:      acme.StatusValid,
+				ValidatedAt: "foobar",
+				Error:       acme.NewError(acme.ErrorMalformedType, "malformed"),
+				Retry:       retry,
+			}
+			return test{
+				ch: updCh,
+				db: &db.MockNoSQLDB{
+					MGet: func(bucket, key []byte) ([]byte, error) {
+						return b, nil
+					},
+					MCmpAndSwap: func(bucket, key, old, nu []byte) ([]byte, bool, error) {
+						dbNew := new(dbChallenge)
+						assert.FatalError(t, json.Unmarshal(nu, dbNew))
+						assert.Equals(t, dbNew.Status, acme.StatusValid)
+						assert.Equals(t, dbNew.RetryOwner, retry.Owner)
+						assert.Equals(t, dbNew.RetryProvisionerID, retry.ProvisionerID)
+						assert.Equals(t, dbNew.RetryNumAttempts, retry.NumAttempts)
+						assert.Equals(t, dbNew.RetryMaxAttempts, retry.MaxAttempts)
+						assert.Equals(t, dbNew.RetryNextAttempt, retry.NextAttempt)
+						return nu, true, nil
+					},
+				},
+			}
+		},
+		"ok/clear-retry-state": func(t *testing.T) test {
+			// Start with retry state in DB
+			dbcWithRetry := &dbChallenge{
+				ID:                 chID,
+				AccountID:          "accountID",
+				Type:               "dns-01",
+				Status:             acme.StatusProcessing,
+				Token:              "token",
+				Value:              "test.ca.smallstep.com",
+				CreatedAt:          clock.Now(),
+				RetryOwner:         1,
+				RetryProvisionerID: "provID",
+				RetryNumAttempts:   3,
+				RetryMaxAttempts:   10,
+				RetryNextAttempt:   "2025-01-28T12:00:00Z",
+			}
+			bWithRetry, err := json.Marshal(dbcWithRetry)
+			assert.FatalError(t, err)
+
+			updCh := &acme.Challenge{
+				ID:          chID,
+				AccountID:   "accountID",
+				Type:        "dns-01",
+				Token:       "token",
+				Value:       "test.ca.smallstep.com",
+				Status:      acme.StatusValid,
+				ValidatedAt: "foobar",
+				Error:       acme.NewError(acme.ErrorMalformedType, "malformed"),
+				Retry:       nil, // Clear retry
+			}
+			return test{
+				ch: updCh,
+				db: &db.MockNoSQLDB{
+					MGet: func(bucket, key []byte) ([]byte, error) {
+						return bWithRetry, nil
+					},
+					MCmpAndSwap: func(bucket, key, old, nu []byte) ([]byte, bool, error) {
+						dbNew := new(dbChallenge)
+						assert.FatalError(t, json.Unmarshal(nu, dbNew))
+						assert.Equals(t, dbNew.Status, acme.StatusValid)
+						// Verify retry state is cleared
+						assert.Equals(t, dbNew.RetryOwner, 0)
+						assert.Equals(t, dbNew.RetryProvisionerID, "")
+						assert.Equals(t, dbNew.RetryNumAttempts, 0)
+						assert.Equals(t, dbNew.RetryMaxAttempts, 0)
+						assert.Equals(t, dbNew.RetryNextAttempt, "")
 						return nu, true, nil
 					},
 				},
