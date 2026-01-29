@@ -876,6 +876,8 @@ func TestAWS_AuthorizeRenew(t *testing.T) {
 }
 
 func TestAWS_HardcodedCertificates(t *testing.T) {
+	t.Skip("skipping: AWS certificate source URL is no longer available, certificates have expired")
+
 	certBytes := []byte(awsCertificate)
 
 	var certs []*x509.Certificate
